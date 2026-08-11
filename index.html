@@ -1,0 +1,1849 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<meta name="theme-color" content="#1C1F26" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Cantiere" />
+<title>Gestionale Cantiere</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<style>
+  html, body { margin:0; padding:0; background:#FAF8F4; }
+  #boot { min-height:100vh; display:flex; align-items:center; justify-content:center;
+          font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          color:#4B5568; font-size:14px; }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+</head>
+<body>
+<div id="root"><div id="boot">Apertura registro…</div></div>
+
+<script type="text/babel" data-presets="react" data-type="module">
+window.jspdfReady = true; // jsPDF già caricato via CDN sopra (window.jspdf.jsPDF disponibile)
+
+
+/* ---------------------------------------------------------------
+   PALETTE
+   inchiostro (ink)   #1C1F26   testo principale, header
+   pergamena (paper)  #FAF8F4   sfondo
+   pergamena scura    #F0ECE3   sfondo pannelli
+   ruggine (rust)     #B5551A   accento primario (timbro/azione)
+   ruggine scuro      #8F4213   hover
+   ardesia (slate)    #4B5568   testo secondario
+   linea (line)       #DCD5C7   bordi
+   verde documento    #3F6B4A   ok / fattura
+   ------------------------------------------------------------- */
+
+const INK = "#1C1F26";
+const PAPER = "#FAF8F4";
+const PANEL = "#F0ECE3";
+const RUST = "#B5551A";
+const RUST_DARK = "#8F4213";
+const SLATE = "#4B5568";
+const LINE = "#DCD5C7";
+const GREEN = "#3F6B4A";
+
+function Icon({ e, size = 16, style, className }) {
+  return (
+    <span
+      className={className}
+      style={{ fontSize: size, lineHeight: 1, display: "inline-flex",
+               alignItems: "center", justifyContent: "center", width: size, ...style }}
+    >
+      {e}
+    </span>
+  );
+}
+
+const IVA_PRESETS = [4, 5, 10, 22];
+
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+
+const eur = (n) =>
+  (Number.isFinite(n) ? n : 0).toLocaleString("it-IT", { style: "currency", currency: "EUR" });
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+const fmtDateIT = (iso) => {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+};
+
+async function storageGet(key, fallback) {
+  try {
+    const raw = localStorage.getItem("cantiere_" + key);
+    if (raw === null) return fallback;
+    return JSON.parse(raw);
+  } catch (e) {
+    return fallback;
+  }
+}
+async function storageSet(key, value) {
+  try {
+    localStorage.setItem("cantiere_" + key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+const emptyClient = () => ({
+  id: uid(),
+  ragioneSociale: "",
+  referente: "",
+  indirizzo: "",
+  citta: "",
+  piva: "",
+  cf: "",
+  telefono: "",
+  email: "",
+  note: "",
+});
+
+const emptyRow = () => ({
+  id: uid(),
+  descrizione: "",
+  unita: "",
+  quantita: 1,
+  prezzo: 0,
+  iva: 22,
+});
+
+const emptyDoc = (tipo, numero) => ({
+  id: uid(),
+  tipo, // 'preventivo' | 'fattura'
+  numero,
+  data: todayISO(),
+  clientId: "",
+  cantiere: "",
+  rows: [emptyRow()],
+  pagamento: "",
+  nota: "",
+  fromId: null,
+  stato: tipo === "preventivo" ? "aperto" : "emessa",
+});
+
+/* ---------------- App ---------------- */
+
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("clienti");
+
+  const [settings, setSettings] = useState({
+    ragioneSociale: "",
+    indirizzo: "",
+    citta: "",
+    piva: "",
+    telefono: "",
+    email: "",
+    iban: "",
+    logo: "",
+  });
+  const [clients, setClients] = useState([]);
+  const [docs, setDocs] = useState([]);
+
+  const [editingClient, setEditingClient] = useState(null); // client object or null
+  const [editingDoc, setEditingDoc] = useState(null); // doc object or null
+  const [previewDoc, setPreviewDoc] = useState(null); // doc object or null
+  const [docFilter, setDocFilter] = useState("tutti");
+  const [clientQuery, setClientQuery] = useState("");
+  const [docQuery, setDocQuery] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null); // {type,id,label}
+  const [saveFlash, setSaveFlash] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const [s, c, d] = await Promise.all([
+        storageGet("settings", null),
+        storageGet("clients", []),
+        storageGet("documents", []),
+      ]);
+      if (s) setSettings((prev) => ({ ...prev, ...s }));
+      setClients(c || []);
+      setDocs(d || []);
+      setLoading(false);
+    })();
+  }, []);
+
+  const flash = () => {
+    setSaveFlash(true);
+    setTimeout(() => setSaveFlash(false), 1200);
+  };
+  const showError = (msg) => {
+    setErrorMsg(msg);
+    setTimeout(() => setErrorMsg(""), 4000);
+  };
+
+  const persistClients = async (next) => {
+    setClients(next);
+    const ok = await storageSet("clients", next);
+    if (ok) flash(); else showError("Salvataggio non riuscito. Riprova.");
+    return ok;
+  };
+  const persistDocs = async (next) => {
+    setDocs(next);
+    const ok = await storageSet("documents", next);
+    if (ok) flash(); else showError("Salvataggio non riuscito. Riprova.");
+    return ok;
+  };
+  const persistSettings = async (next) => {
+    setSettings(next);
+    const ok = await storageSet("settings", next);
+    if (ok) flash();
+    else showError("Logo o dati troppo grandi da salvare. Prova un'immagine più piccola.");
+    return ok;
+  };
+
+  const clientById = (id) => clients.find((c) => c.id === id);
+
+  const nextNumero = (tipo) => {
+    const year = new Date().getFullYear();
+    const count = docs.filter((d) => d.tipo === tipo && d.numero.endsWith(`/${year}`)).length;
+    return `${String(count + 1).padStart(3, "0")}/${year}`;
+  };
+
+  /* ---- client CRUD ---- */
+  const saveClient = async (client) => {
+    const exists = clients.some((c) => c.id === client.id);
+    const next = exists
+      ? clients.map((c) => (c.id === client.id ? client : c))
+      : [...clients, client];
+    await persistClients(next);
+    setEditingClient(null);
+  };
+  const deleteClient = async (id) => {
+    await persistClients(clients.filter((c) => c.id !== id));
+    setConfirmDelete(null);
+  };
+
+  /* ---- doc CRUD ---- */
+  const saveDoc = async (doc) => {
+    const exists = docs.some((d) => d.id === doc.id);
+    const next = exists ? docs.map((d) => (d.id === doc.id ? doc : d)) : [...docs, doc];
+    await persistDocs(next);
+    setEditingDoc(null);
+  };
+  const deleteDoc = async (id) => {
+    await persistDocs(docs.filter((d) => d.id !== id));
+    setConfirmDelete(null);
+  };
+  const transformToInvoice = async (preventivo) => {
+    const fattura = {
+      ...preventivo,
+      id: uid(),
+      tipo: "fattura",
+      numero: nextNumero("fattura"),
+      data: todayISO(),
+      fromId: preventivo.id,
+      stato: "emessa",
+      rows: preventivo.rows.map((r) => ({ ...r, id: uid() })),
+    };
+    const next = [...docs, fattura];
+    await persistDocs(next);
+    setPreviewDoc(fattura);
+  };
+
+  const filteredClients = useMemo(() => {
+    const q = clientQuery.trim().toLowerCase();
+    if (!q) return clients;
+    return clients.filter((c) =>
+      [c.ragioneSociale, c.referente, c.piva, c.cf, c.citta, c.email]
+        .filter(Boolean)
+        .some((v) => v.toLowerCase().includes(q))
+    );
+  }, [clients, clientQuery]);
+
+  const filteredDocs = useMemo(() => {
+    let list = docs;
+    if (docFilter !== "tutti") list = list.filter((d) => d.tipo === docFilter);
+    const q = docQuery.trim().toLowerCase();
+    if (q) {
+      list = list.filter((d) => {
+        const cli = clientById(d.clientId);
+        return [d.numero, d.cantiere, cli?.ragioneSociale]
+          .filter(Boolean)
+          .some((v) => v.toLowerCase().includes(q));
+      });
+    }
+    return [...list].sort((a, b) => (a.data < b.data ? 1 : -1));
+  }, [docs, docFilter, docQuery, clients]);
+
+  if (loading) {
+    return (
+      <div
+        style={{ background: PAPER, color: INK }}
+        className="min-h-screen flex items-center justify-center font-sans"
+      >
+        <div className="text-sm tracking-wide" style={{ color: SLATE }}>
+          Apertura registro…
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: PAPER, color: INK }} className="min-h-screen font-sans pb-20">
+      <style>{`
+        * { box-sizing: border-box; }
+        .font-sans { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .font-mono { font-family: ui-monospace, "SF Mono", "Roboto Mono", Menlo, monospace; }
+        input, select, textarea { font-family: inherit; }
+        input:focus, select:focus, textarea:focus { outline: 2px solid ${RUST}; outline-offset: 1px; }
+        button:focus-visible { outline: 2px solid ${RUST}; outline-offset: 2px; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background: ${LINE}; border-radius: 4px; }
+        @media print {
+          .no-print { display: none !important; }
+          body { background: white !important; }
+        }
+      `}</style>
+
+      <Header settings={settings} saveFlash={saveFlash} />
+
+      {errorMsg && (
+        <div
+          className="no-print mx-3 sm:mx-auto sm:max-w-3xl mt-2 rounded-lg px-3 py-2 text-xs font-medium flex items-center gap-2"
+          style={{ background: "#FBEAEA", color: "#B04141", border: "1px solid #E7B5B5" }}
+        >
+          <Icon e="⚠️" size={14} className="flex-shrink-0" /> {errorMsg}
+        </div>
+      )}
+
+      <main className="max-w-3xl mx-auto px-3 sm:px-5 pt-4">
+        {tab === "clienti" && (
+          <ClientiView
+            clients={filteredClients}
+            query={clientQuery}
+            setQuery={setClientQuery}
+            onNew={() => setEditingClient(emptyClient())}
+            onEdit={(c) => setEditingClient(c)}
+            onDelete={(c) =>
+              setConfirmDelete({ type: "client", id: c.id, label: c.ragioneSociale || "cliente senza nome" })
+            }
+            docsCountFor={(id) => docs.filter((d) => d.clientId === id).length}
+          />
+        )}
+
+        {tab === "documenti" && (
+          <DocumentiView
+            docs={filteredDocs}
+            clients={clients}
+            filter={docFilter}
+            setFilter={setDocFilter}
+            query={docQuery}
+            setQuery={setDocQuery}
+            onNewPreventivo={() =>
+              setEditingDoc(emptyDoc("preventivo", nextNumero("preventivo")))
+            }
+            onOpen={(d) => setPreviewDoc(d)}
+            onEdit={(d) => setEditingDoc(d)}
+            onDelete={(d) =>
+              setConfirmDelete({
+                type: "doc",
+                id: d.id,
+                label: `${d.tipo === "preventivo" ? "Preventivo" : "Fattura"} n. ${d.numero}`,
+              })
+            }
+            clientById={clientById}
+          />
+        )}
+
+        {tab === "impostazioni" && (
+          <ImpostazioniView settings={settings} onSave={persistSettings} />
+        )}
+      </main>
+
+      <TabBar tab={tab} setTab={setTab} />
+
+      {editingClient && (
+        <ClientEditor
+          client={editingClient}
+          onCancel={() => setEditingClient(null)}
+          onSave={saveClient}
+        />
+      )}
+
+      {editingDoc && (
+        <DocEditor
+          doc={editingDoc}
+          clients={clients}
+          onCancel={() => setEditingDoc(null)}
+          onSave={saveDoc}
+          onQuickAddClient={(c) => persistClients([...clients, c])}
+        />
+      )}
+
+      {previewDoc && (
+        <DocPreview
+          doc={previewDoc}
+          client={clientById(previewDoc.clientId)}
+          settings={settings}
+          onClose={() => setPreviewDoc(null)}
+          onEdit={() => {
+            setEditingDoc(previewDoc);
+            setPreviewDoc(null);
+          }}
+          onTransform={
+            previewDoc.tipo === "preventivo"
+              ? () => transformToInvoice(previewDoc)
+              : null
+          }
+        />
+      )}
+
+      {confirmDelete && (
+        <ConfirmDialog
+          label={confirmDelete.label}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() =>
+            confirmDelete.type === "client"
+              ? deleteClient(confirmDelete.id)
+              : deleteDoc(confirmDelete.id)
+          }
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- Header & Nav ---------------- */
+
+function Header({ settings, saveFlash }) {
+  return (
+    <header
+      className="no-print sticky top-0 z-20 border-b px-4 py-3 flex items-center gap-3"
+      style={{ background: INK, borderColor: LINE }}
+    >
+      {settings.logo ? (
+        <img src={settings.logo} alt="logo" className="h-9 w-9 object-contain rounded bg-white p-0.5" />
+      ) : (
+        <div
+          className="h-9 w-9 rounded flex items-center justify-center flex-shrink-0"
+          style={{ background: RUST }}
+        >
+          <Icon e="🏢" size={18} />
+        </div>
+      )}
+      <div className="min-w-0">
+        <div className="text-white font-semibold text-sm truncate">
+          {settings.ragioneSociale || "Gestionale Cantiere"}
+        </div>
+        <div className="text-[11px] truncate" style={{ color: "#B8BFC9" }}>
+          Anagrafica · Preventivi · Fatture
+        </div>
+      </div>
+      <div className="ml-auto text-[11px] transition-opacity" style={{ color: RUST, opacity: saveFlash ? 1 : 0 }}>
+        salvato ✓
+      </div>
+    </header>
+  );
+}
+
+function TabBar({ tab, setTab }) {
+  const items = [
+    { id: "clienti", label: "Clienti", icon: Users },
+    { id: "documenti", label: "Documenti", icon: FileText },
+    { id: "impostazioni", label: "Azienda", icon: Settings },
+  ];
+  return (
+    <nav
+      className="no-print fixed bottom-0 left-0 right-0 z-20 border-t flex"
+      style={{ background: INK, borderColor: "#2C313C" }}
+    >
+      {items.map(({ id, label, icon: Icon }) => {
+        const active = tab === id;
+        return (
+          <button
+            key={id}
+            onClick={() => setTab(id)}
+            className="flex-1 flex flex-col items-center gap-0.5 py-2.5"
+            style={{ color: active ? RUST : "#8890A0" }}
+          >
+            <Icon size={20} strokeWidth={active ? 2.4 : 2} />
+            <span className="text-[11px] font-medium">{label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+/* ---------------- Clienti ---------------- */
+
+function ClientiView({ clients, query, setQuery, onNew, onEdit, onDelete, docsCountFor }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <div className="relative flex-1">
+          <Icon e="🔍" size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: SLATE }} />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Cerca per nome, P.IVA, città…"
+            className="w-full pl-9 pr-3 py-2.5 rounded-lg text-sm border bg-white"
+            style={{ borderColor: LINE }}
+          />
+        </div>
+        <button
+          onClick={onNew}
+          className="flex items-center gap-1 px-3 py-2.5 rounded-lg text-sm font-medium text-white"
+          style={{ background: RUST }}
+        >
+          <Icon e="➕" size={16} /> Nuovo
+        </button>
+      </div>
+
+      {clients.length === 0 ? (
+        <EmptyState
+          icon={Users}
+          title="Nessun cliente"
+          text="Aggiungi il primo cliente per iniziare a creare preventivi e fatture."
+        />
+      ) : (
+        <ul className="space-y-2">
+          {clients.map((c) => (
+            <li
+              key={c.id}
+              className="rounded-lg border bg-white p-3 flex items-start gap-3"
+              style={{ borderColor: LINE }}
+            >
+              <div
+                className="h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 text-sm font-semibold text-white"
+                style={{ background: SLATE }}
+              >
+                {(c.ragioneSociale || "?").slice(0, 1).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1" onClick={() => onEdit(c)}>
+                <div className="font-medium text-sm truncate">{c.ragioneSociale || "Senza nome"}</div>
+                <div className="text-xs truncate" style={{ color: SLATE }}>
+                  {[c.piva && `P.IVA ${c.piva}`, c.citta].filter(Boolean).join(" · ") || "—"}
+                </div>
+                <div className="text-[11px] mt-0.5" style={{ color: RUST }}>
+                  {docsCountFor(c.id)} documento/i
+                </div>
+              </div>
+              <div className="flex flex-col gap-1">
+                <button onClick={() => onEdit(c)} className="p-1.5 rounded" style={{ color: SLATE }}>
+                  <Icon e="✏️" size={16} />
+                </button>
+                <button onClick={() => onDelete(c)} className="p-1.5 rounded" style={{ color: "#B04141" }}>
+                  <Icon e="🗑️" size={16} />
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ClientEditor({ client, onCancel, onSave }) {
+  const [form, setForm] = useState(client);
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const valid = form.ragioneSociale.trim().length > 0;
+
+  return (
+    <Sheet title={client.ragioneSociale ? "Modifica cliente" : "Nuovo cliente"} onClose={onCancel}>
+      <div className="space-y-3">
+        <Field label="Ragione sociale / Nome e cognome *">
+          <input className="input" value={form.ragioneSociale} onChange={set("ragioneSociale")} />
+        </Field>
+        <Field label="Referente">
+          <input className="input" value={form.referente} onChange={set("referente")} />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="P.IVA">
+            <input className="input" value={form.piva} onChange={set("piva")} />
+          </Field>
+          <Field label="Codice fiscale">
+            <input className="input" value={form.cf} onChange={set("cf")} />
+          </Field>
+        </div>
+        <Field label="Indirizzo">
+          <input className="input" value={form.indirizzo} onChange={set("indirizzo")} />
+        </Field>
+        <Field label="Città">
+          <input className="input" value={form.citta} onChange={set("citta")} />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Telefono">
+            <input className="input" value={form.telefono} onChange={set("telefono")} />
+          </Field>
+          <Field label="Email">
+            <input className="input" value={form.email} onChange={set("email")} />
+          </Field>
+        </div>
+        <Field label="Note">
+          <textarea className="input" rows={3} value={form.note} onChange={set("note")} />
+        </Field>
+      </div>
+      <SheetFooter>
+        <button onClick={onCancel} className="btn-ghost">Annulla</button>
+        <button
+          disabled={!valid}
+          onClick={() => onSave(form)}
+          className="btn-primary"
+          style={{ opacity: valid ? 1 : 0.5 }}
+        >
+          <Icon e="💾" size={15} /> Salva cliente
+        </button>
+      </SheetFooter>
+    </Sheet>
+  );
+}
+
+/* ---------------- Documenti ---------------- */
+
+function DocumentiView({
+  docs, clients, filter, setFilter, query, setQuery,
+  onNewPreventivo, onOpen, onEdit, onDelete, clientById,
+}) {
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <div className="relative flex-1">
+          <Icon e="🔍" size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: SLATE }} />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Cerca per numero, cantiere, cliente…"
+            className="w-full pl-9 pr-3 py-2.5 rounded-lg text-sm border bg-white"
+            style={{ borderColor: LINE }}
+          />
+        </div>
+        <button
+          onClick={onNewPreventivo}
+          className="flex items-center gap-1 px-3 py-2.5 rounded-lg text-sm font-medium text-white whitespace-nowrap"
+          style={{ background: RUST }}
+        >
+          <Icon e="➕" size={16} /> Preventivo
+        </button>
+      </div>
+
+      <div className="flex gap-2 mb-3">
+        {[
+          ["tutti", "Tutti"],
+          ["preventivo", "Preventivi"],
+          ["fattura", "Fatture"],
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            onClick={() => setFilter(id)}
+            className="px-3 py-1.5 rounded-full text-xs font-medium border"
+            style={{
+              borderColor: filter === id ? RUST : LINE,
+              background: filter === id ? RUST : "white",
+              color: filter === id ? "white" : SLATE,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {docs.length === 0 ? (
+        <EmptyState
+          icon={FileText}
+          title="Nessun documento"
+          text="Crea un preventivo per un cliente: potrai poi trasformarlo in fattura con un tap."
+        />
+      ) : (
+        <ul className="space-y-2">
+          {docs.map((d) => {
+            const cli = clientById(d.clientId);
+            const tot = docTotals(d);
+            const isFattura = d.tipo === "fattura";
+            return (
+              <li
+                key={d.id}
+                className="rounded-lg border bg-white p-3"
+                style={{ borderColor: LINE }}
+                onClick={() => onOpen(d)}
+              >
+                <div className="flex items-start gap-3">
+                  <div
+                    className="h-9 w-9 rounded flex items-center justify-center flex-shrink-0"
+                    style={{ background: isFattura ? "#EAF1EC" : "#F5E9DE" }}
+                  >
+                    {isFattura ? (
+                      <Icon e="🧾" size={17} />
+                    ) : (
+                      <Icon e="📋" size={17} />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="font-mono text-xs" style={{ color: isFattura ? GREEN : RUST_DARK }}>
+                        {isFattura ? "FT" : "PV"} {d.numero}
+                      </span>
+                      <span className="text-[11px]" style={{ color: SLATE }}>
+                        {fmtDateIT(d.data)}
+                      </span>
+                    </div>
+                    <div className="text-sm font-medium truncate">
+                      {cli?.ragioneSociale || "Cliente non specificato"}
+                    </div>
+                    <div className="text-xs truncate" style={{ color: SLATE }}>
+                      {d.cantiere || "—"}
+                    </div>
+                  </div>
+                  <div className="text-right flex-shrink-0">
+                    <div className="text-sm font-semibold font-mono">{eur(tot.totale)}</div>
+                    <div className="flex gap-1 mt-1 justify-end">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onEdit(d); }}
+                        className="p-1 rounded" style={{ color: SLATE }}
+                      >
+                        <Icon e="✏️" size={14} />
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onDelete(d); }}
+                        className="p-1 rounded" style={{ color: "#B04141" }}
+                      >
+                        <Icon e="🗑️" size={14} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function docTotals(doc) {
+  const byIva = {};
+  let imponibile = 0;
+  let totale = 0;
+  for (const r of doc.rows) {
+    const rowTot = (Number(r.quantita) || 0) * (Number(r.prezzo) || 0);
+    imponibile += rowTot;
+    const ivaAmt = rowTot * ((Number(r.iva) || 0) / 100);
+    totale += rowTot + ivaAmt;
+    const key = Number(r.iva) || 0;
+    if (!byIva[key]) byIva[key] = { imponibile: 0, iva: 0 };
+    byIva[key].imponibile += rowTot;
+    byIva[key].iva += ivaAmt;
+  }
+  return { imponibile, totale, byIva };
+}
+
+function buildDocText(doc, client, settings, totals) {
+  const L = [];
+  L.push(settings.ragioneSociale || "Ragione sociale non impostata");
+  if (settings.indirizzo || settings.citta) L.push([settings.indirizzo, settings.citta].filter(Boolean).join(", "));
+  const infoLine = [settings.piva && `P.IVA ${settings.piva}`, settings.telefono, settings.email].filter(Boolean).join(" · ");
+  if (infoLine) L.push(infoLine);
+  L.push("");
+  L.push(`${doc.tipo === "fattura" ? "FATTURA" : "PREVENTIVO"} N. ${doc.numero} — ${fmtDateIT(doc.data)}`);
+  L.push("");
+  L.push(`Cliente: ${client?.ragioneSociale || "—"}`);
+  if (client?.indirizzo || client?.citta) L.push([client?.indirizzo, client?.citta].filter(Boolean).join(", "));
+  if (client?.piva) L.push(`P.IVA ${client.piva}`);
+  L.push(`Cantiere/oggetto: ${doc.cantiere || "—"}`);
+  L.push("");
+  L.push("Voci:");
+  doc.rows.forEach((r, i) => {
+    const rowTot = (Number(r.quantita) || 0) * (Number(r.prezzo) || 0);
+    L.push(`${i + 1}. ${r.descrizione || "—"} — ${r.quantita || 0} ${r.unita || ""} x ${eur(Number(r.prezzo) || 0)} (IVA ${r.iva}%) = ${eur(rowTot)}`);
+  });
+  L.push("");
+  Object.entries(totals.byIva).forEach(([rate, v]) => {
+    L.push(`Imponibile IVA ${rate}%: ${eur(v.imponibile)}  ·  IVA: ${eur(v.iva)}`);
+  });
+  L.push(`TOTALE: ${eur(totals.totale)}`);
+  if (doc.pagamento) L.push(`Pagamento: ${doc.pagamento}`);
+  if (settings.iban) L.push(`IBAN: ${settings.iban}`);
+  if (doc.nota) L.push(`Note: ${doc.nota}`);
+  return L.join("\n");
+}
+
+/* ---------------- Doc editor ---------------- */
+
+function DocEditor({ doc, clients, onCancel, onSave, onQuickAddClient }) {
+  const [form, setForm] = useState(doc);
+  const [quickClient, setQuickClient] = useState(false);
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  const updateRow = (id, patch) => {
+    setForm({
+      ...form,
+      rows: form.rows.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    });
+  };
+  const addRow = () => setForm({ ...form, rows: [...form.rows, emptyRow()] });
+  const removeRow = (id) =>
+    setForm({ ...form, rows: form.rows.length > 1 ? form.rows.filter((r) => r.id !== id) : form.rows });
+
+  const totals = docTotals(form);
+  const valid = form.clientId && form.rows.some((r) => r.descrizione.trim());
+
+  return (
+    <Sheet
+      title={`${form.tipo === "preventivo" ? "Preventivo" : "Fattura"} n. ${form.numero}`}
+      onClose={onCancel}
+    >
+      <div className="space-y-3">
+        <Field label="Cliente *">
+          {!quickClient ? (
+            <div className="flex gap-2">
+              <select
+                className="input"
+                value={form.clientId}
+                onChange={(e) => setForm({ ...form, clientId: e.target.value })}
+              >
+                <option value="">Seleziona cliente…</option>
+                {clients.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.ragioneSociale}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => setQuickClient(true)}
+                className="px-3 rounded-lg border text-xs font-medium whitespace-nowrap"
+                style={{ borderColor: LINE, color: RUST_DARK }}
+              >
+                + nuovo
+              </button>
+            </div>
+          ) : (
+            <QuickClient
+              onCancel={() => setQuickClient(false)}
+              onAdd={(c) => {
+                onQuickAddClient(c);
+                setForm({ ...form, clientId: c.id });
+                setQuickClient(false);
+              }}
+            />
+          )}
+        </Field>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Data">
+            <input type="date" className="input" value={form.data} onChange={set("data")} />
+          </Field>
+          <Field label="Cantiere / oggetto">
+            <input className="input" value={form.cantiere} onChange={set("cantiere")} placeholder="es. Rifacimento tetto" />
+          </Field>
+        </div>
+
+        <div>
+          <div className="text-xs font-semibold mb-1.5" style={{ color: SLATE }}>
+            Voci
+          </div>
+          <div className="space-y-2">
+            {form.rows.map((r, idx) => (
+              <RowEditor
+                key={r.id}
+                row={r}
+                index={idx}
+                onChange={(patch) => updateRow(r.id, patch)}
+                onRemove={() => removeRow(r.id)}
+                removable={form.rows.length > 1}
+              />
+            ))}
+          </div>
+          <button
+            onClick={addRow}
+            className="mt-2 flex items-center gap-1 text-xs font-medium px-3 py-2 rounded-lg border w-full justify-center"
+            style={{ borderColor: LINE, color: RUST_DARK, borderStyle: "dashed" }}
+          >
+            <Icon e="➕" size={14} /> Aggiungi voce libera
+          </button>
+        </div>
+
+        <div className="rounded-lg p-3 space-y-1" style={{ background: PANEL }}>
+          {Object.entries(totals.byIva).map(([rate, v]) => (
+            <div key={rate} className="flex justify-between text-xs" style={{ color: SLATE }}>
+              <span>Imponibile IVA {rate}%</span>
+              <span className="font-mono">{eur(v.imponibile)} · IVA {eur(v.iva)}</span>
+            </div>
+          ))}
+          <div className="flex justify-between text-sm font-semibold pt-1 border-t" style={{ borderColor: LINE }}>
+            <span>Totale documento</span>
+            <span className="font-mono">{eur(totals.totale)}</span>
+          </div>
+        </div>
+
+        <Field label="Modalità di pagamento">
+          <select className="input" value={form.pagamento} onChange={set("pagamento")}>
+            <option value="">Non specificata</option>
+            <option value="Bonifico bancario">Bonifico bancario</option>
+            <option value="Contanti">Contanti</option>
+            <option value="Assegno">Assegno</option>
+            <option value="Rate">Pagamento rateale</option>
+            <option value="RID / SDD">RID / SDD</option>
+          </select>
+        </Field>
+
+        <Field label="Nota a piè di pagina">
+          <textarea
+            className="input"
+            rows={4}
+            value={form.nota}
+            onChange={set("nota")}
+            placeholder="Condizioni, garanzie, riferimenti, scadenze…"
+          />
+        </Field>
+      </div>
+
+      <SheetFooter>
+        <button onClick={onCancel} className="btn-ghost">Annulla</button>
+        <button
+          disabled={!valid}
+          onClick={() => onSave(form)}
+          className="btn-primary"
+          style={{ opacity: valid ? 1 : 0.5 }}
+        >
+          <Icon e="💾" size={15} /> Salva documento
+        </button>
+      </SheetFooter>
+    </Sheet>
+  );
+}
+
+function QuickClient({ onCancel, onAdd }) {
+  const [name, setName] = useState("");
+  return (
+    <div className="flex gap-2">
+      <input
+        className="input"
+        placeholder="Ragione sociale / nome"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        autoFocus
+      />
+      <button
+        onClick={() => name.trim() && onAdd({ ...emptyClient(), ragioneSociale: name.trim() })}
+        className="px-3 rounded-lg text-white text-xs font-medium"
+        style={{ background: RUST }}
+      >
+        <Icon e="✓" size={15} />
+      </button>
+      <button onClick={onCancel} className="px-3 rounded-lg border text-xs" style={{ borderColor: LINE }}>
+        <Icon e="✕" size={15} />
+      </button>
+    </div>
+  );
+}
+
+function RowEditor({ row, index, onChange, onRemove, removable }) {
+  const rowTotal = (Number(row.quantita) || 0) * (Number(row.prezzo) || 0);
+  return (
+    <div className="rounded-lg border p-2.5 bg-white" style={{ borderColor: LINE }}>
+      <div className="flex items-start gap-2">
+        <span className="text-[11px] font-mono pt-2" style={{ color: SLATE }}>
+          {String(index + 1).padStart(2, "0")}
+        </span>
+        <textarea
+          className="input flex-1 text-sm"
+          rows={2}
+          placeholder="Descrizione voce (libera)…"
+          value={row.descrizione}
+          onChange={(e) => onChange({ descrizione: e.target.value })}
+        />
+        {removable && (
+          <button onClick={onRemove} className="p-1 mt-1" style={{ color: "#B04141" }}>
+            <Icon e="🗑️" size={15} />
+          </button>
+        )}
+      </div>
+      <div className="grid grid-cols-4 gap-1.5 mt-2 pl-6">
+        <div>
+          <label className="mini-label">U.M.</label>
+          <input className="input-sm" placeholder="pz/mq/h" value={row.unita} onChange={(e) => onChange({ unita: e.target.value })} />
+        </div>
+        <div>
+          <label className="mini-label">Q.tà</label>
+          <input type="number" className="input-sm" value={row.quantita} onChange={(e) => onChange({ quantita: e.target.value })} />
+        </div>
+        <div>
+          <label className="mini-label">Prezzo €</label>
+          <input type="number" className="input-sm" value={row.prezzo} onChange={(e) => onChange({ prezzo: e.target.value })} />
+        </div>
+        <div>
+          <label className="mini-label">IVA %</label>
+          <select className="input-sm" value={row.iva} onChange={(e) => onChange({ iva: e.target.value })}>
+            {IVA_PRESETS.includes(Number(row.iva)) ? null : <option value={row.iva}>{row.iva}</option>}
+            {IVA_PRESETS.map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+            <option value={0}>0</option>
+          </select>
+        </div>
+      </div>
+      <div className="text-right text-xs font-mono mt-1.5 pl-6" style={{ color: RUST_DARK }}>
+        Totale riga: {eur(rowTotal)}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Preview / PDF export ---------------- */
+/* Il PDF viene disegnato direttamente con jsPDF (niente screenshot via
+   html2canvas: negli WebView in-app spesso e' bloccato o produce pagine
+   vuote). Un'unica libreria da caricare, testo vero e nitido nel PDF. */
+
+let scriptLoadPromises = {};
+function loadScriptOnce(src) {
+  if (scriptLoadPromises[src]) return scriptLoadPromises[src];
+  scriptLoadPromises[src] = new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) { resolve(); return; }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Rete non disponibile per scaricare il generatore PDF."));
+    document.head.appendChild(s);
+  });
+  return scriptLoadPromises[src];
+}
+
+async function ensureJsPdf() {
+  if (window.jspdf && window.jspdf.jsPDF) return;
+  await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");
+  if (!window.jspdf || !window.jspdf.jsPDF) {
+    throw new Error("Il generatore PDF non si e' caricato correttamente.");
+  }
+}
+
+function buildDocPdf(doc, client, settings, totals) {
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF("p", "mm", "a4");
+  const pageW = 210, pageH = 297, margin = 15;
+  let y = margin;
+  const maxY = pageH - margin;
+
+  const newPageIfNeeded = (need = 10) => {
+    if (y + need > maxY) {
+      pdf.addPage();
+      y = margin;
+    }
+  };
+
+  if (settings.logo) {
+    try {
+      pdf.addImage(settings.logo, "PNG", margin, y, 22, 22, undefined, "FAST");
+    } catch (e) { /* logo non valido: si ignora, il resto del PDF prosegue */ }
+  }
+  const textX = settings.logo ? margin + 26 : margin;
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(12);
+  pdf.text(settings.ragioneSociale || "Ragione sociale non impostata", textX, y + 5);
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(8.5);
+  pdf.setTextColor(90, 90, 90);
+  const addrLine = [settings.indirizzo, settings.citta].filter(Boolean).join(", ");
+  if (addrLine) pdf.text(addrLine, textX, y + 10);
+  const infoLine = [settings.piva && `P.IVA ${settings.piva}`, settings.telefono, settings.email].filter(Boolean).join("  \u00b7  ");
+  if (infoLine) pdf.text(infoLine, textX, y + 14.5);
+
+  const tipoLabel = doc.tipo === "fattura" ? "FATTURA" : "PREVENTIVO";
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(10);
+  pdf.setTextColor(30, 30, 30);
+  pdf.text(`${tipoLabel} N. ${doc.numero}`, pageW - margin, y + 5, { align: "right" });
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(9);
+  pdf.setTextColor(90, 90, 90);
+  pdf.text(fmtDateIT(doc.data), pageW - margin, y + 10, { align: "right" });
+
+  y += 26;
+  pdf.setDrawColor(220, 213, 199);
+  pdf.line(margin, y, pageW - margin, y);
+  y += 7;
+
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(8);
+  pdf.setTextColor(120, 120, 120);
+  pdf.text("CLIENTE", margin, y);
+  pdf.text("CANTIERE / OGGETTO", pageW / 2 + 4, y);
+  y += 4.5;
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(9.5);
+  pdf.setTextColor(20, 20, 20);
+  pdf.text(client?.ragioneSociale || "\u2014", margin, y);
+  pdf.text(doc.cantiere || "\u2014", pageW / 2 + 4, y);
+  y += 4.5;
+  pdf.setFontSize(8.5);
+  pdf.setTextColor(90, 90, 90);
+  const cliAddr = [client?.indirizzo, client?.citta].filter(Boolean).join(", ");
+  if (cliAddr) { pdf.text(cliAddr, margin, y); }
+  if (client?.piva) { pdf.text(`P.IVA ${client.piva}`, margin, y + 4); }
+
+  y += 11;
+
+  const cols = [
+    { key: "descrizione", label: "Descrizione", x: margin, w: 82, align: "left" },
+    { key: "unita", label: "U.M.", x: margin + 84, w: 12, align: "right" },
+    { key: "quantita", label: "Q.ta", x: margin + 98, w: 14, align: "right" },
+    { key: "prezzo", label: "Prezzo", x: margin + 114, w: 20, align: "right" },
+    { key: "iva", label: "IVA", x: margin + 136, w: 12, align: "right" },
+    { key: "totale", label: "Totale", x: pageW - margin, w: 22, align: "right" },
+  ];
+
+  const drawTableHeader = () => {
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(8);
+    pdf.setTextColor(120, 120, 120);
+    cols.forEach((c) => pdf.text(c.label, c.x, y, { align: c.align }));
+    y += 2.5;
+    pdf.setDrawColor(220, 213, 199);
+    pdf.line(margin, y, pageW - margin, y);
+    y += 4.5;
+  };
+  drawTableHeader();
+
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(8.7);
+  pdf.setTextColor(20, 20, 20);
+
+  doc.rows.forEach((r) => {
+    const rowTotal = (Number(r.quantita) || 0) * (Number(r.prezzo) || 0);
+    const descLines = pdf.splitTextToSize(r.descrizione || "\u2014", 80);
+    const rowH = Math.max(5, descLines.length * 4);
+    newPageIfNeeded(rowH + 4);
+    pdf.text(descLines, cols[0].x, y);
+    pdf.text(String(r.unita || "\u2014"), cols[1].x, y, { align: "right" });
+    pdf.text(String(r.quantita ?? ""), cols[2].x, y, { align: "right" });
+    pdf.text(eur(Number(r.prezzo) || 0), cols[3].x, y, { align: "right" });
+    pdf.text(`${r.iva}%`, cols[4].x, y, { align: "right" });
+    pdf.text(eur(rowTotal), cols[5].x, y, { align: "right" });
+    y += rowH;
+    pdf.setDrawColor(238, 234, 225);
+    pdf.line(margin, y, pageW - margin, y);
+    y += 4;
+  });
+
+  y += 1;
+  newPageIfNeeded(10 + Object.keys(totals.byIva).length * 5);
+
+  const totX0 = pageW - margin - 70;
+  Object.entries(totals.byIva).forEach(([rate, v]) => {
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(8.5);
+    pdf.setTextColor(90, 90, 90);
+    pdf.text(`Imponibile IVA ${rate}%`, totX0, y);
+    pdf.text(eur(v.imponibile), pageW - margin, y, { align: "right" });
+    y += 4.3;
+    pdf.text(`IVA ${rate}%`, totX0, y);
+    pdf.text(eur(v.iva), pageW - margin, y, { align: "right" });
+    y += 4.3;
+  });
+  y += 1;
+  pdf.setDrawColor(180, 180, 180);
+  pdf.line(totX0, y, pageW - margin, y);
+  y += 5;
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(11);
+  pdf.setTextColor(20, 20, 20);
+  pdf.text("Totale", totX0, y);
+  pdf.text(eur(totals.totale), pageW - margin, y, { align: "right" });
+  y += 10;
+
+  if (doc.pagamento || doc.nota || settings.iban) {
+    newPageIfNeeded(20);
+    pdf.setDrawColor(220, 213, 199);
+    pdf.line(margin, y, pageW - margin, y);
+    y += 6;
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(8.7);
+    pdf.setTextColor(70, 70, 70);
+    if (doc.pagamento) {
+      pdf.setFont("helvetica", "bold");
+      pdf.text("Pagamento: ", margin, y);
+      pdf.setFont("helvetica", "normal");
+      pdf.text(doc.pagamento, margin + 20, y);
+      y += 5;
+    }
+    if (settings.iban) {
+      pdf.setFont("helvetica", "bold");
+      pdf.text("IBAN: ", margin, y);
+      pdf.setFont("helvetica", "normal");
+      pdf.text(settings.iban, margin + 12, y);
+      y += 5;
+    }
+    if (doc.nota) {
+      pdf.setFont("helvetica", "bold");
+      pdf.text("Note:", margin, y);
+      y += 4.5;
+      pdf.setFont("helvetica", "normal");
+      const noteLines = pdf.splitTextToSize(doc.nota, pageW - margin * 2);
+      noteLines.forEach((line) => {
+        newPageIfNeeded(5);
+        pdf.text(line, margin, y);
+        y += 4.3;
+      });
+    }
+  }
+
+  return pdf;
+}
+
+function DocPreview({ doc, client, settings, onClose, onEdit, onTransform }) {
+  const totals = docTotals(doc);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfError, setPdfError] = useState("");
+  const [pdfLink, setPdfLink] = useState(null);
+  const [pdfShared, setPdfShared] = useState(false);
+  const [showTextExport, setShowTextExport] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const docText = useMemo(() => buildDocText(doc, client, settings, totals), [doc, client, settings, totals]);
+
+  const copyDocText = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(docText);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        setShowTextExport(true);
+      }
+    } catch (e) {
+      setShowTextExport(true);
+    }
+  };
+
+  const handleExportPdf = async () => {
+    setPdfError("");
+    setPdfLink(null);
+    setPdfShared(false);
+    setPdfBusy(true);
+    try {
+      await ensureJsPdf();
+      const pdf = buildDocPdf(doc, client, settings, totals);
+      const prefix = doc.tipo === "fattura" ? "Fattura" : "Preventivo";
+      const safeNum = doc.numero.replace(/[^\w-]/g, "_");
+      const filename = `${prefix}_${safeNum}.pdf`;
+      const blob = pdf.output("blob");
+
+      // 1° tentativo: foglio di condivisione nativo Android (permette di
+      // salvare, stampare o inviare il PDF con qualsiasi app installata).
+      // È il metodo più affidabile dentro webview con permessi limitati.
+      let shared = false;
+      try {
+        if (navigator.canShare && navigator.share) {
+          const file = new File([blob], filename, { type: "application/pdf" });
+          if (navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: filename });
+            shared = true;
+          }
+        }
+      } catch (shareErr) {
+        // condivisione annullata dall'utente o non supportata: si passa al link
+        shared = false;
+      }
+
+      if (shared) {
+        setPdfShared(true);
+      } else {
+        // 2° tentativo: link diretto in formato data-URI (non richiede
+        // permessi di download, funziona anche dove i blob: sono bloccati)
+        const dataUri = pdf.output("datauristring");
+        setPdfLink({ url: dataUri, filename });
+      }
+    } catch (err) {
+      setPdfError(err.message || "Esportazione PDF non riuscita.");
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+
+  return (
+    <Sheet
+      title={`${doc.tipo === "preventivo" ? "Preventivo" : "Fattura"} n. ${doc.numero}`}
+      onClose={onClose}
+      wide
+    >
+      {pdfError && (
+        <div
+          className="no-print mb-2 rounded-lg px-3 py-2 text-xs font-medium flex items-center gap-2"
+          style={{ background: "#FBEAEA", color: "#B04141", border: "1px solid #E7B5B5" }}
+        >
+          <Icon e="⚠️" size={14} className="flex-shrink-0" /> {pdfError}
+        </div>
+      )}
+      <div id="print-area" className="bg-white rounded-lg border p-4 sm:p-6" style={{ borderColor: LINE }}>
+        <div className="flex items-start justify-between gap-4 pb-4 border-b" style={{ borderColor: LINE }}>
+          <div className="flex items-center gap-3">
+            {settings.logo ? (
+              <img src={settings.logo} alt="logo" className="h-14 w-14 object-contain" />
+            ) : (
+              <div className="h-14 w-14 rounded flex items-center justify-center" style={{ background: PANEL }}>
+                <Icon e="🏢" size={24} />
+              </div>
+            )}
+            <div>
+              <div className="font-semibold text-sm">{settings.ragioneSociale || "Ragione sociale non impostata"}</div>
+              <div className="text-xs" style={{ color: SLATE }}>{settings.indirizzo}{settings.citta ? `, ${settings.citta}` : ""}</div>
+              <div className="text-xs" style={{ color: SLATE }}>
+                {[settings.piva && `P.IVA ${settings.piva}`, settings.telefono, settings.email].filter(Boolean).join(" · ")}
+              </div>
+            </div>
+          </div>
+          <div className="text-right flex-shrink-0">
+            <div
+              className="text-xs font-mono font-semibold px-2 py-1 rounded"
+              style={{ background: doc.tipo === "fattura" ? "#EAF1EC" : "#F5E9DE", color: doc.tipo === "fattura" ? GREEN : RUST_DARK }}
+            >
+              {doc.tipo === "fattura" ? "FATTURA" : "PREVENTIVO"} N. {doc.numero}
+            </div>
+            <div className="text-xs mt-1" style={{ color: SLATE }}>{fmtDateIT(doc.data)}</div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4 py-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: SLATE }}>Cliente</div>
+            <div className="text-sm font-medium">{client?.ragioneSociale || "—"}</div>
+            <div className="text-xs" style={{ color: SLATE }}>{client?.indirizzo}{client?.citta ? `, ${client.citta}` : ""}</div>
+            <div className="text-xs" style={{ color: SLATE }}>{client?.piva && `P.IVA ${client.piva}`}</div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wide font-semibold" style={{ color: SLATE }}>Cantiere / oggetto</div>
+            <div className="text-sm">{doc.cantiere || "—"}</div>
+          </div>
+        </div>
+
+        <table className="w-full text-xs border-collapse">
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${LINE}` }}>
+              <th className="text-left py-1.5" style={{ color: SLATE }}>Descrizione</th>
+              <th className="text-right py-1.5" style={{ color: SLATE }}>U.M.</th>
+              <th className="text-right py-1.5" style={{ color: SLATE }}>Q.tà</th>
+              <th className="text-right py-1.5" style={{ color: SLATE }}>Prezzo</th>
+              <th className="text-right py-1.5" style={{ color: SLATE }}>IVA</th>
+              <th className="text-right py-1.5" style={{ color: SLATE }}>Totale</th>
+            </tr>
+          </thead>
+          <tbody>
+            {doc.rows.map((r) => (
+              <tr key={r.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td className="py-1.5 pr-2">{r.descrizione}</td>
+                <td className="py-1.5 text-right">{r.unita}</td>
+                <td className="py-1.5 text-right font-mono">{r.quantita}</td>
+                <td className="py-1.5 text-right font-mono">{eur(Number(r.prezzo))}</td>
+                <td className="py-1.5 text-right font-mono">{r.iva}%</td>
+                <td className="py-1.5 text-right font-mono">{eur((Number(r.quantita) || 0) * (Number(r.prezzo) || 0))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div className="flex justify-end mt-3">
+          <div className="w-full sm:w-64 space-y-1">
+            {Object.entries(totals.byIva).map(([rate, v]) => (
+              <div key={rate} className="flex justify-between text-xs" style={{ color: SLATE }}>
+                <span>Imponibile {rate}%</span>
+                <span className="font-mono">{eur(v.imponibile)}</span>
+              </div>
+            ))}
+            {Object.entries(totals.byIva).map(([rate, v]) => (
+              <div key={"iva" + rate} className="flex justify-between text-xs" style={{ color: SLATE }}>
+                <span>IVA {rate}%</span>
+                <span className="font-mono">{eur(v.iva)}</span>
+              </div>
+            ))}
+            <div className="flex justify-between text-sm font-semibold pt-1.5 border-t" style={{ borderColor: LINE }}>
+              <span>Totale</span>
+              <span className="font-mono">{eur(totals.totale)}</span>
+            </div>
+          </div>
+        </div>
+
+        {(doc.pagamento || doc.nota) && (
+          <div className="mt-5 pt-3 border-t text-xs space-y-1" style={{ borderColor: LINE, color: SLATE }}>
+            {doc.pagamento && <div><span className="font-semibold">Pagamento:</span> {doc.pagamento}</div>}
+            {doc.nota && <div className="whitespace-pre-wrap"><span className="font-semibold">Note:</span> {doc.nota}</div>}
+            {settings.iban && <div><span className="font-semibold">IBAN:</span> {settings.iban}</div>}
+          </div>
+        )}
+      </div>
+
+      {pdfError && (
+        <div
+          className="no-print mt-3 rounded-lg px-3 py-2 text-xs font-medium flex items-center gap-2"
+          style={{ background: "#FBEAEA", color: "#B04141", border: "1px solid #E7B5B5" }}
+        >
+          <Icon e="⚠️" size={14} className="flex-shrink-0" /> {pdfError}
+        </div>
+      )}
+
+      {pdfShared && (
+        <div
+          className="no-print mt-3 rounded-lg px-3 py-2 text-xs font-medium flex items-center gap-2"
+          style={{ background: "#EAF1EC", color: GREEN, border: "1px solid #C7DBCB" }}
+        >
+          <Icon e="✓" size={14} className="flex-shrink-0" /> PDF inviato al foglio di condivisione: scegli lì dove salvarlo o quale app di stampa usare.
+        </div>
+      )}
+
+      {pdfLink && (
+        <a
+          href={pdfLink.url}
+          download={pdfLink.filename}
+          target="_blank"
+          rel="noreferrer"
+          className="no-print mt-3 flex items-center justify-center gap-2 rounded-lg py-2.5 text-sm font-semibold text-white"
+          style={{ background: GREEN }}
+        >
+          <Icon e="📄" size={16} /> PDF pronto — tocca qui per aprirlo o salvarlo
+        </a>
+      )}
+
+      <div className="no-print mt-3 rounded-lg p-3" style={{ background: PANEL }}>
+        <div className="text-xs" style={{ color: SLATE }}>
+          Se il PDF non si genera sul telefono, copia i dati e incollali in chat: te lo preparo io, pronto da scaricare.
+        </div>
+        <div className="flex gap-2 mt-2">
+          <button onClick={copyDocText} type="button" className="btn-ghost flex-1 justify-center">
+            <Icon e="🗐" size={14} /> {copied ? "Copiato!" : "Copia dati documento"}
+          </button>
+          <button onClick={() => setShowTextExport((v) => !v)} type="button" className="btn-ghost">
+            {showTextExport ? "Nascondi" : "Mostra testo"}
+          </button>
+        </div>
+        {showTextExport && (
+          <textarea
+            readOnly
+            value={docText}
+            rows={8}
+            onFocus={(e) => e.target.select()}
+            className="input mt-2 font-mono text-[11px]"
+          />
+        )}
+      </div>
+
+      <SheetFooter>
+        <button onClick={onEdit} className="btn-ghost"><Icon e="✏️" size={15} /> Modifica</button>
+        <button onClick={handleExportPdf} disabled={pdfBusy} className="btn-primary" style={{ opacity: pdfBusy ? 0.6 : 1 }}>
+          <Icon e="🖨️" size={15} /> {pdfBusy ? "Generazione…" : "Genera / condividi PDF"}
+        </button>
+        <button onClick={() => window.print()} className="btn-ghost">
+          Stampa (browser)
+        </button>
+        {onTransform && (
+          <button onClick={onTransform} className="btn-primary">
+            <Icon e="⇄" size={15} /> Trasforma in fattura
+          </button>
+        )}
+      </SheetFooter>
+    </Sheet>
+  );
+}
+
+/* ---------------- Impostazioni ---------------- */
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Impossibile leggere il file."));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
+}
+
+function resizeImageFile(file, maxDim = 320) {
+  return new Promise((resolve, reject) => {
+    if (!file.type || !file.type.startsWith("image/")) {
+      reject(new Error("Il file scelto non è un'immagine."));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Impossibile leggere il file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Immagine non valida."));
+      img.onload = () => {
+        try {
+          let w = img.width, h = img.height;
+          if (w > h && w > maxDim) { h = Math.round((h * maxDim) / w); w = maxDim; }
+          else if (h >= w && h > maxDim) { w = Math.round((w * maxDim) / h); h = maxDim; }
+          const canvas = document.createElement("canvas");
+          canvas.width = w || maxDim; canvas.height = h || maxDim;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/png"));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function generateInitialsLogo(text, bgColor) {
+  const initials = (text || "AZ")
+    .trim()
+    .split(/\s+/)
+    .map((w) => w[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase() || "AZ";
+  const canvas = document.createElement("canvas");
+  canvas.width = 240; canvas.height = 240;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = bgColor;
+  const r = 40;
+  ctx.beginPath();
+  ctx.moveTo(r, 0);
+  ctx.arcTo(240, 0, 240, 240, r);
+  ctx.arcTo(240, 240, 0, 240, r);
+  ctx.arcTo(0, 240, 0, 0, r);
+  ctx.arcTo(0, 0, 240, 0, r);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = "#FFFFFF";
+  ctx.font = "bold 110px Arial, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(initials, 120, 130);
+  return canvas.toDataURL("image/png");
+}
+
+function ImpostazioniView({ settings, onSave }) {
+  const [form, setForm] = useState(settings);
+  const [logoBusy, setLogoBusy] = useState(false);
+  const [logoError, setLogoError] = useState("");
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  const useInitialsLogo = async () => {
+    setLogoError("");
+    try {
+      const dataUrl = generateInitialsLogo(form.ragioneSociale, RUST);
+      const next = { ...form, logo: dataUrl };
+      setForm(next);
+      const ok = await onSave(next);
+      if (!ok) setLogoError("Logo creato ma il salvataggio non è riuscito.");
+    } catch (err) {
+      setLogoError("Impossibile generare il logo.");
+    }
+  };
+
+  const onLogo = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLogoError("");
+    setLogoBusy(true);
+
+    let dataUrl = null;
+    try {
+      dataUrl = await resizeImageFile(file, 320);
+    } catch (err) {
+      // il ridimensionamento può fallire su alcuni browser/webview:
+      // in tal caso usiamo comunque il file originale, senza bloccare l'utente
+      try {
+        dataUrl = await readFileAsDataUrl(file);
+      } catch (err2) {
+        setLogoError(err2.message || "Impossibile leggere l'immagine selezionata.");
+        setLogoBusy(false);
+        e.target.value = "";
+        return;
+      }
+    }
+
+    const next = { ...form, logo: dataUrl };
+    setForm(next);
+    setLogoBusy(false);
+    e.target.value = ""; // consente di riselezionare lo stesso file in seguito
+
+    const ok = await onSave(next); // salva subito, senza dover premere "Salva"
+    if (!ok) setLogoError("Logo mostrato qui, ma il salvataggio permanente non è riuscito (file troppo pesante?).");
+  };
+
+  const removeLogo = async () => {
+    const next = { ...form, logo: "" };
+    setForm(next);
+    await onSave(next);
+  };
+
+  const [showUrlBox, setShowUrlBox] = useState(false);
+  const [logoUrlInput, setLogoUrlInput] = useState("");
+  const [urlBusy, setUrlBusy] = useState(false);
+
+  const applyLogoFromUrlOrData = async () => {
+    const val = logoUrlInput.trim();
+    if (!val) return;
+    setLogoError("");
+    setUrlBusy(true);
+    try {
+      if (val.startsWith("data:image")) {
+        const next = { ...form, logo: val };
+        setForm(next);
+        const ok = await onSave(next);
+        if (!ok) setLogoError("Logo mostrato, ma il salvataggio non è riuscito.");
+      } else {
+        // proviamo a scaricare l'immagine dal link e a convertirla in locale;
+        // se il sito blocca il download incrociato, usiamo comunque il link diretto
+        try {
+          const res = await fetch(val, { mode: "cors" });
+          const blob = await res.blob();
+          const dataUrl = await resizeImageFile(blob, 320);
+          const next = { ...form, logo: dataUrl };
+          setForm(next);
+          const ok = await onSave(next);
+          if (!ok) setLogoError("Logo mostrato, ma il salvataggio non è riuscito.");
+        } catch (fetchErr) {
+          const next = { ...form, logo: val };
+          setForm(next);
+          const ok = await onSave(next);
+          setLogoError(
+            ok
+              ? "Logo impostato dal link (l'anteprima nel PDF potrebbe non includerlo se il sito blocca l'accesso esterno)."
+              : "Salvataggio non riuscito."
+          );
+        }
+      }
+      setShowUrlBox(false);
+      setLogoUrlInput("");
+    } catch (err) {
+      setLogoError(err.message || "Link o codice immagine non valido.");
+    } finally {
+      setUrlBusy(false);
+    }
+  };
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(settings);
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-lg border bg-white p-3" style={{ borderColor: LINE }}>
+        <div className="flex items-center gap-3">
+          {form.logo ? (
+            <img src={form.logo} className="h-14 w-14 object-contain rounded border" style={{ borderColor: LINE }} />
+          ) : (
+            <div className="h-14 w-14 rounded flex items-center justify-center" style={{ background: PANEL }}>
+              <Icon e="🖼️" size={22} />
+            </div>
+          )}
+          <div className="flex-1">
+            <div className="text-sm font-medium">Logo azienda</div>
+            <div className="text-xs" style={{ color: SLATE }}>
+              {logoBusy ? "Caricamento…" : "PNG o JPG, si salva subito"}
+            </div>
+            {logoError && <div className="text-xs mt-0.5" style={{ color: "#B04141" }}>{logoError}</div>}
+          </div>
+          {form.logo && (
+            <button onClick={removeLogo} type="button" className="p-2 rounded-lg border" style={{ borderColor: LINE, color: "#B04141" }}>
+              <Icon e="🗑️" size={15} />
+            </button>
+          )}
+          <label
+            htmlFor="logo-file-input"
+            className="text-xs font-medium px-3 py-2 rounded-lg border cursor-pointer select-none"
+            style={{ borderColor: LINE, color: RUST_DARK, opacity: logoBusy ? 0.6 : 1 }}
+          >
+            {logoBusy ? "…" : "Scegli"}
+          </label>
+          <input
+            id="logo-file-input"
+            type="file"
+            accept="image/png, image/jpeg, image/webp"
+            onChange={onLogo}
+            className="hidden"
+          />
+        </div>
+
+        <div className="flex flex-wrap gap-3 mt-2">
+          <button
+            type="button"
+            onClick={() => setShowUrlBox((v) => !v)}
+            className="text-xs underline"
+            style={{ color: SLATE }}
+          >
+            {showUrlBox ? "Annulla" : "\"Scegli\" non si apre? Incolla un link immagine"}
+          </button>
+          <button
+            type="button"
+            onClick={useInitialsLogo}
+            disabled={!form.ragioneSociale.trim()}
+            className="text-xs underline"
+            style={{ color: SLATE, opacity: form.ragioneSociale.trim() ? 1 : 0.5 }}
+          >
+            Oppure genera un logo con le iniziali (funziona sempre, offline)
+          </button>
+        </div>
+
+        {showUrlBox && (
+          <div className="flex gap-2 mt-2">
+            <input
+              className="input"
+              placeholder="https://... oppure data:image/png;base64,..."
+              value={logoUrlInput}
+              onChange={(e) => setLogoUrlInput(e.target.value)}
+            />
+            <button
+              type="button"
+              onClick={applyLogoFromUrlOrData}
+              disabled={urlBusy || !logoUrlInput.trim()}
+              className="px-3 rounded-lg text-white text-xs font-medium"
+              style={{ background: RUST, opacity: urlBusy ? 0.6 : 1 }}
+            >
+              {urlBusy ? "…" : <Icon e="✓" size={15} />}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border bg-white p-3 space-y-3" style={{ borderColor: LINE }}>
+        <Field label="Ragione sociale *">
+          <input className="input" value={form.ragioneSociale} onChange={set("ragioneSociale")} />
+        </Field>
+        <Field label="Indirizzo">
+          <input className="input" value={form.indirizzo} onChange={set("indirizzo")} />
+        </Field>
+        <Field label="Città">
+          <input className="input" value={form.citta} onChange={set("citta")} />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="P.IVA">
+            <input className="input" value={form.piva} onChange={set("piva")} />
+          </Field>
+          <Field label="Telefono">
+            <input className="input" value={form.telefono} onChange={set("telefono")} />
+          </Field>
+        </div>
+        <Field label="Email">
+          <input className="input" value={form.email} onChange={set("email")} />
+        </Field>
+        <Field label="IBAN (per bonifici)">
+          <input className="input font-mono" value={form.iban} onChange={set("iban")} />
+        </Field>
+      </div>
+
+      <button
+        onClick={() => onSave(form)}
+        disabled={!dirty}
+        className="btn-primary w-full justify-center"
+        style={{ opacity: dirty ? 1 : 0.5 }}
+      >
+        <Icon e="💾" size={15} /> Salva dati azienda
+      </button>
+
+      <div className="rounded-lg p-3 text-xs flex gap-2" style={{ background: PANEL, color: SLATE }}>
+        <Icon e="⚠️" size={15} className="flex-shrink-0 mt-0.5" />
+        <span>
+          Questi dati e il logo vengono stampati automaticamente nell'intestazione di ogni preventivo e fattura.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Shared UI ---------------- */
+
+function Sheet({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 z-30 no-print">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div
+        className={`absolute inset-x-0 bottom-0 top-6 sm:top-10 bg-white rounded-t-2xl flex flex-col ${wide ? "sm:max-w-2xl" : "sm:max-w-lg"} sm:mx-auto sm:left-0 sm:right-0`}
+      >
+        <div className="flex items-center gap-2 px-4 py-3 border-b flex-shrink-0" style={{ borderColor: LINE }}>
+          <button onClick={onClose} className="p-1 -ml-1" style={{ color: SLATE }}>
+            <Icon e="‹" size={20} />
+          </button>
+          <div className="font-semibold text-sm truncate">{title}</div>
+          <button onClick={onClose} className="ml-auto p-1" style={{ color: SLATE }}>
+            <Icon e="✕" size={18} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-4 py-3">{children}</div>
+      </div>
+      <style>{`
+        .input { width: 100%; border: 1px solid ${LINE}; border-radius: 8px; padding: 8px 10px; font-size: 13.5px; background: white; }
+        .input-sm { width: 100%; border: 1px solid ${LINE}; border-radius: 6px; padding: 5px 6px; font-size: 12.5px; }
+        .mini-label { display:block; font-size: 10px; color: ${SLATE}; margin-bottom: 2px; }
+        .btn-primary { display: inline-flex; align-items:center; gap:6px; background:${RUST}; color:white; font-size:13px; font-weight:600; padding:9px 14px; border-radius:8px; }
+        .btn-ghost { display: inline-flex; align-items:center; gap:6px; background:white; border:1px solid ${LINE}; color:${INK}; font-size:13px; font-weight:500; padding:9px 14px; border-radius:8px; }
+      `}</style>
+    </div>
+  );
+}
+
+function SheetFooter({ children }) {
+  return (
+    <div className="sticky bottom-0 bg-white border-t mt-4 -mx-4 px-4 py-3 flex gap-2 flex-wrap" style={{ borderColor: LINE }}>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block">
+      <span className="block text-xs font-medium mb-1" style={{ color: SLATE }}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function EmptyState({ icon: Icon, title, text }) {
+  return (
+    <div className="rounded-xl border border-dashed p-8 text-center" style={{ borderColor: LINE }}>
+      <Icon size={28} className="mx-auto mb-2" style={{ color: SLATE }} />
+      <div className="text-sm font-medium">{title}</div>
+      <div className="text-xs mt-1" style={{ color: SLATE }}>{text}</div>
+    </div>
+  );
+}
+
+function ConfirmDialog({ label, onCancel, onConfirm }) {
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center px-6 no-print">
+      <div className="absolute inset-0 bg-black/40" onClick={onCancel} />
+      <div className="relative bg-white rounded-xl p-4 w-full max-w-xs">
+        <div className="text-sm font-semibold">Confermi l'eliminazione?</div>
+        <div className="text-xs mt-1" style={{ color: SLATE }}>
+          Stai per eliminare “{label}”. L'operazione non è reversibile.
+        </div>
+        <div className="flex gap-2 mt-4">
+          <button onClick={onCancel} className="btn-ghost flex-1 justify-center">Annulla</button>
+          <button
+            onClick={onConfirm}
+            className="flex-1 justify-center inline-flex items-center gap-1 text-white text-sm font-medium py-2 rounded-lg"
+            style={{ background: "#B04141" }}
+          >
+            <Icon e="🗑️" size={14} /> Elimina
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+const rootEl = document.getElementById("root");
+const root = ReactDOM.createRoot(rootEl);
+root.render(<App />);
+
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js").catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
